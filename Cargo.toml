@@ -1,0 +1,11 @@
+[package]
+name = "stm32_qcw_rust"
+
+[dependencies.stm32h7]
+version = "0.15.1"
+features = ["stm32h753"]
+
+[dependencies]
+cortex-m-rt = "*"
+cortex-m = "*"
+panic-halt = "*"
