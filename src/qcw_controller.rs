@@ -204,33 +204,42 @@ pub fn init(devices: &mut Peripherals, config: Config) {
     });
 
     // configure GPIO D5 to be an input for HRTIM_EEV3
-    devices.GPIOD.moder.modify(|_, w| {
-        w.moder5().alternate()
-    });
     devices.GPIOD.afrl.modify(|_, w| {
         w.afr5().af2()
     });
     devices.GPIOD.pupdr.modify(|_, w| {
         w.pupdr5().pull_down()
     });
+    devices.GPIOD.moder.modify(|_, w| {
+        w.moder5().alternate()
+    });
 
     // configure external event 3 to be HRTIM_EEV3 (GPIO D5),
     // triggered by rising edge
     devices.HRTIM_COMMON.eecr1.modify(|_, w| {
         w
-            .ee3src().variant(1)
+            .ee3src().variant(0)
             .ee3sns().variant(1)
     });
 
     // configure timer b to capture external event 3 period
     devices.HRTIM_TIMB.timbcr.modify(|_, w| {
         w.ck_pscx().variant(0b101)
+        .cont().clear_bit()
+        .retrig().set_bit()
     });
     devices.HRTIM_TIMB.rstbr.modify(|_, w| {
         w.extevnt3().set_bit()
     });
     devices.HRTIM_TIMB.cpt1bcr.modify(|_, w| {
         w.exev3cpt().set_bit()
+    });
+    devices.HRTIM_TIMB.perbr.modify(|_, w| {
+        w.perx().variant(0xF000)
+    });
+    // enable capture 1 interrupts
+    devices.HRTIM_TIMB.timbdier5.modify(|_, w| {
+        w.cmp1ie().set_bit()
     });
     // clear the capture interrupt flag
     devices.HRTIM_TIMB.timbicr.write(|w| {
@@ -269,6 +278,7 @@ pub fn start(devices: &mut Peripherals) {
         w
         .tacen().set_bit()
         .tccen().set_bit()
+        .tbcen().set_bit()
         .sync_src().variant(0b10)
         .sync_out().variant(0)
     });
