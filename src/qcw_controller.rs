@@ -1,12 +1,6 @@
-use cortex_m::interrupt::{self, Mutex};
+use cortex_m::interrupt::Mutex;
 use core::cell::RefCell;
-use stm32h7::stm32h753::Peripherals;
-
-pub enum QcwState {
-    Disabled,
-    Armed,
-    Enabled,
-}
+use stm32h7::stm32h753::{Peripherals, interrupt};
 
 static QCW_CONFIG: Mutex<RefCell<Config>> = Mutex::new(RefCell::new(Config {
     phase_limit_low: 0.0,
@@ -18,6 +12,62 @@ pub struct Config {
     pub phase_limit_low: f32,
     pub phase_limit_high: f32,
 }
+
+/*
+QCW Controller Signal Path
+--------------------------
+
+        Frequency Detector
+        __________________
+                                                   *----[HRTIM Timer B]--------------*
+ (feedback ct signal)                              |                                 |
+[GPIO D5] ------------> (HRTIM_EEV3) --------*---> | (capture 1)                     | 
+- OT: AF                - rising edge        |     |                                 |
+- AF: 2                                      *---> | (reset counter)                 |
+                                                   |                                 |
+                                                   *---------------------------------*
+
+        ! Accessed by software querying the cpt1 bit of HRTIM_TIMB.bisr
+        ! Capture interrupt is disabled in favor of polling 
+
+        OCD Detector
+        -------------
+
+(OCD Signal (active low))
+[GPIO A11]
+- OT: INPUT
+
+        ! Accessed by software reading the GPIOA data in register
+
+        Phase Shift Signal Generator
+        ----------------------------
+
+*----[HRTIM Timer A]--------------*
+|                                 |
+|                                 |
+|                         (out_1) | ----------------------> (GPIO C6)
+|                                 |                          OT: AF
+|                                 |                          AF: 1
+*---------------------------------*
+
+*----[HRTIM Timer C]--------------*
+|                                 |
+|                                 |
+|                         (out_1) | ----------------------> (GPIO A9)
+|                                 |                          OT: AF
+|                                 |                          AF: 2
+|                                 |
+*---------------------------------*
+
+        ! Software programs HRTIM Timers A and C such that they are
+        ! programmed to the same frequency, with a phase offset
+        ! between them, and swaps their phase offsets back and forth every few
+        ! (even) number of cycles, allowing each half of the bridge to hard-switch
+        ! half of the time, rather than one always soft-switching and the other hard switching.
+
+*/
+
+
 
 pub fn init(devices: &mut Peripherals, config: Config) {
     // enable and reset HRTIM
@@ -142,7 +192,52 @@ pub fn init(devices: &mut Peripherals, config: Config) {
         w.cmp1().set_bit()
     });
 
-    interrupt::free(|cs| *QCW_CONFIG.borrow(cs).borrow_mut() = config);
+    // enable and reset GPIOD
+    devices.RCC.ahb4enr.modify(|_, w| {
+        w.gpioden().set_bit()
+    });
+    devices.RCC.ahb4rstr.write(|w| {
+        w.gpiodrst().set_bit()
+    });
+    devices.RCC.ahb4rstr.write(|w| {
+        w.gpiodrst().clear_bit()
+    });
+
+    // configure GPIO D5 to be an input for HRTIM_EEV3
+    devices.GPIOD.moder.modify(|_, w| {
+        w.moder5().alternate()
+    });
+    devices.GPIOD.afrl.modify(|_, w| {
+        w.afr5().af2()
+    });
+    devices.GPIOD.pupdr.modify(|_, w| {
+        w.pupdr5().pull_down()
+    });
+
+    // configure external event 3 to be HRTIM_EEV3 (GPIO D5),
+    // triggered by rising edge
+    devices.HRTIM_COMMON.eecr1.modify(|_, w| {
+        w
+            .ee3src().variant(1)
+            .ee3sns().variant(1)
+    });
+
+    // configure timer b to capture external event 3 period
+    devices.HRTIM_TIMB.timbcr.modify(|_, w| {
+        w.ck_pscx().variant(0b101)
+    });
+    devices.HRTIM_TIMB.rstbr.modify(|_, w| {
+        w.extevnt3().set_bit()
+    });
+    devices.HRTIM_TIMB.cpt1bcr.modify(|_, w| {
+        w.exev3cpt().set_bit()
+    });
+    // clear the capture interrupt flag
+    devices.HRTIM_TIMB.timbicr.write(|w| {
+        w.cpt1c().set_bit()
+    });
+
+    cortex_m::interrupt::free(|cs| *QCW_CONFIG.borrow(cs).borrow_mut() = config);
 }
 
 struct HrtimChannelTimings {
@@ -180,7 +275,7 @@ pub fn start(devices: &mut Peripherals) {
 }
 
 pub fn set_period_phase(devices: &mut Peripherals, period: u16, phase: f32, flip_phases: bool) {
-    let (phase_limit_low, phase_limit_high) = interrupt::free(|cs| {
+    let (phase_limit_low, phase_limit_high) = cortex_m::interrupt::free(|cs| {
         let config = QCW_CONFIG.borrow(cs).borrow();
         (config.phase_limit_low, config.phase_limit_high)
     });
@@ -211,4 +306,19 @@ pub fn set_period_phase(devices: &mut Peripherals, period: u16, phase: f32, flip
     devices.HRTIM_TIMC.cmp2cr.modify(|_, w| {
         w.cmp2x().variant(channel_c_timings.cmp2)
     });
+}
+
+pub fn get_frequency_counter_capture(devices: &mut Peripherals) -> Option<u16> {
+    if devices.HRTIM_TIMB.timbisr.read().cpt1().bit_is_set() {
+        devices.HRTIM_TIMB.timbicr.write(|w| {
+            w.cpt1c().set_bit()
+        });
+        Some(devices.HRTIM_TIMB.cpt1br.read().cpt1x().bits())
+    } else {
+        None
+    }
+}
+
+#[interrupt]
+fn HRTIM_TIMB() {
 }

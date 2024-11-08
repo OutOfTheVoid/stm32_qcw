@@ -12,6 +12,7 @@ use stm32h7::stm32h753;
 
 mod qcw_controller;
 mod pll_setup;
+mod time;
 
 #[entry]
 fn main() -> ! {
@@ -26,7 +27,7 @@ fn main() -> ! {
     };
     qcw_controller::init(&mut devices, qcw_config);
 
-    let period = 500;
+    let mut period = 500;
     let mut x = 0.3;
 
     qcw_controller::set_period_phase(&mut devices, period, x, false);
@@ -36,11 +37,17 @@ fn main() -> ! {
         while x < 1.0 {
             cortex_m::asm::delay(1000000);
             x += 0.001;
+            if let Some(counted_period) = qcw_controller::get_frequency_counter_capture(&mut devices) {
+                period = counted_period;
+            }
             qcw_controller::set_period_phase(&mut devices, period, x, false);
         }
         while x > 0.3 {
             cortex_m::asm::delay(1000000);
             x -= 0.001;
+            if let Some(counted_period) = qcw_controller::get_frequency_counter_capture(&mut devices) {
+                period = counted_period;
+            }
             qcw_controller::set_period_phase(&mut devices, period, x, false);
         }
     }
