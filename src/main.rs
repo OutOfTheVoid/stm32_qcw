@@ -7,48 +7,52 @@ extern crate cortex_m;
 extern crate stm32h7;
 
 use cortex_m_rt::entry;
+use device_access::{set_devices, with_devices_mut};
 use pll_setup::{setup_system_pll, switch_cpu_to_system_pll};
-use stm32h7::stm32h753;
+use stm32h7::stm32h753::{self, crc::init};
+use cortex_m::{asm::wfi, interrupt::Mutex};
+use core::{borrow::BorrowMut, mem::MaybeUninit};
 
 mod qcw_controller;
 mod pll_setup;
 mod time;
+mod device_access;
 
 #[entry]
 fn main() -> ! {
-    let mut devices = stm32h753::Peripherals::take().unwrap();
+    set_devices(stm32h753::Peripherals::take().unwrap());
 
-    setup_system_pll(&devices, pll_setup::SystemPllSpeed::MHz400);
-    switch_cpu_to_system_pll(&devices);
+    with_devices_mut(|devices, _| {
+        setup_system_pll(devices, pll_setup::SystemPllSpeed::MHz400);
+        switch_cpu_to_system_pll(devices);
+    });
+
+    let initial_period = (400_000_000 / 400_000) as u16;
 
     let qcw_config = qcw_controller::Config {
         phase_limit_high: 1.0,
-        phase_limit_low: 0.3
+        phase_limit_low: 0.3,
+        allowed_period_deviation: initial_period / 4
     };
-    qcw_controller::init(&mut devices, qcw_config);
+    qcw_controller::init(qcw_config);
 
-    let mut period = 500;
-    let mut x = 0.3;
-
-    qcw_controller::set_period_phase(&mut devices, period, x, false);
-    qcw_controller::start(&mut devices);
+    unsafe { cortex_m::interrupt::enable() };
+    
+    qcw_controller::start(initial_period, 0.5);
+    
+    let mut phase = 0.5;
 
     loop {
-        while x < 1.0 {
+        wfi();
+        while phase < 1.0 {
             cortex_m::asm::delay(1000000);
-            x += 0.001;
-            if let Some(counted_period) = qcw_controller::get_frequency_counter_capture(&mut devices) {
-                period = counted_period;
-            }
-            qcw_controller::set_period_phase(&mut devices, period, x, false);
+            phase += 0.0001;
+            qcw_controller::set_phase(phase);
         }
-        while x > 0.3 {
+        while phase > 0.5 {
             cortex_m::asm::delay(1000000);
-            x -= 0.001;
-            if let Some(counted_period) = qcw_controller::get_frequency_counter_capture(&mut devices) {
-                period = counted_period;
-            }
-            qcw_controller::set_period_phase(&mut devices, period, x, false);
+            phase -= 0.0001;
+            qcw_controller::set_phase(phase);
         }
     }
 }
