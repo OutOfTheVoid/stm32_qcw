@@ -10,13 +10,14 @@ use cortex_m_rt::entry;
 use device_access::{set_devices, with_devices_mut};
 use pll_setup::{setup_system_pll, switch_cpu_to_system_pll};
 use stm32h7::stm32h753::{self, crc::init};
-use cortex_m::{asm::wfi, interrupt::Mutex};
+use cortex_m::{asm::{self, wfi}, interrupt::Mutex};
 use core::{borrow::BorrowMut, mem::MaybeUninit};
 
 mod qcw_controller;
 mod pll_setup;
 mod time;
 mod device_access;
+mod debug_led;
 
 #[entry]
 fn main() -> ! {
@@ -27,32 +28,27 @@ fn main() -> ! {
         switch_cpu_to_system_pll(devices);
     });
 
-    let initial_period = (400_000_000 / 400_000) as u16;
+    debug_led::init();
+    debug_led::set(true);
+    time::init();
 
-    let qcw_config = qcw_controller::Config {
-        phase_limit_high: 1.0,
-        phase_limit_low: 0.3,
-        allowed_period_deviation: initial_period / 4
-    };
-    qcw_controller::init(qcw_config);
+    /*let qcw_config = qcw_controller::Config {
+        delay_compensation: 0,
+        startup_period: 500,
+        allowed_period_deviation: 100,
+    };*/
+    //qcw_controller::init(qcw_config);
 
     unsafe { cortex_m::interrupt::enable() };
     
-    qcw_controller::start(initial_period, 0.5);
-    
-    let mut phase = 0.5;
+    //qcw_controller::start(qcw_controller::RunMode::Test { phase: 0.5, time_us: 1000 });
 
     loop {
-        wfi();
-        while phase < 1.0 {
-            cortex_m::asm::delay(1000000);
-            phase += 0.0001;
-            qcw_controller::set_phase(phase);
-        }
-        while phase > 0.5 {
-            cortex_m::asm::delay(1000000);
-            phase -= 0.0001;
-            qcw_controller::set_phase(phase);
-        }
+        //if !qcw_controller::is_running() {
+            // wait 50 ms
+        //    _ = qcw_controller::clear_overcurrent();
+        //    qcw_controller::start(qcw_controller::RunMode::Test { phase: 0.5, time_us: 1000 });
+        //}
+        debug_led::set(((time::micros() / 1000000) & 1) != 0);
     }
 }

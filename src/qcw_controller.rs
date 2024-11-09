@@ -2,27 +2,48 @@ use cortex_m::{interrupt::Mutex, peripheral::nvic};
 use core::cell::RefCell;
 use stm32h7::stm32h753::{self, interrupt, Peripherals};
 
-use crate::device_access::with_devices_mut;
+use crate::device_access::{with_devices, with_devices_mut};
 
 #[derive(Copy, Clone, Debug)]
 pub struct Config {
-    pub phase_limit_low: f32,
-    pub phase_limit_high: f32,
+    pub delay_compensation: u16,
+    pub startup_period: u16,
     pub allowed_period_deviation: u16
 }
 
 static QCW_CONFIG: Mutex<RefCell<Config>> = Mutex::new(RefCell::new(Config {
-    phase_limit_low: 0.0,
-    phase_limit_high: 1.0,
+    delay_compensation: 0,
     allowed_period_deviation: 0,
+    startup_period: 0,
 }));
 
+#[derive(Copy, Clone, Debug)]
+pub enum RunMode {
+    Test { phase: f32, time_us: u32 },
+    Burst { phase: f32, time_us: u32 },
+    Ramp { phase_t0: f32, phase_t1: f32, time_us: u32 },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OperationState {
+    Idle,
+    Locking,
+    Running,
+    Overcurrent,
+}
+
 struct QcwState {
+    state: OperationState,
+    run_mode: Option<RunMode>,
+    t0: u32,
     period: u16,
     phase_setpoint: f32,
 }
 
 static QCW_STATE: Mutex<RefCell<QcwState>> = Mutex::new(RefCell::new(QcwState {
+    state: OperationState::Idle,
+    run_mode: None,
+    t0: 0,
     period: 0,
     phase_setpoint: 0.0
 }));
@@ -91,27 +112,7 @@ QCW Controller Signal Path
 
 pub fn init(config: Config) {
     with_devices_mut(|devices, cs| {
-        // enable and reset HRTIM
-        devices.RCC.apb2enr.modify(|_, w| {
-            w.hrtimen().set_bit()
-        });
-        devices.RCC.apb2rstr.write(|w| {
-            w.hrtimrst().set_bit()
-        });
-        devices.RCC.apb2rstr.write(|w| {
-            w.hrtimrst().clear_bit()
-        });
-
-        // enable and reset GPIOC
-        devices.RCC.ahb4enr.modify(|_, w| {
-            w.gpiocen().set_bit()
-        });
-        devices.RCC.ahb4rstr.write(|w| {
-            w.gpiocrst().set_bit()
-        });
-        devices.RCC.ahb4rstr.write(|w| {
-            w.gpiocrst().clear_bit()
-        });
+        // NOTE: peripheral clocks are enabled and peripherals reset in device_access.rs
 
         // configure GPIO C6 to be hrtim output A1, push-pull
         devices.GPIOC.moder.modify(|_, w| {
@@ -157,22 +158,6 @@ pub fn init(config: Config) {
             .cmp2().set_bit()
         });
 
-        // Reset timer a on eev3
-        devices.HRTIM_TIMA.rstar.modify(|_, w| {
-            w.extevnt3().set_bit()
-        });
-
-        // enable and reset GPIOA
-        devices.RCC.ahb4enr.modify(|_, w| {
-            w.gpioaen().set_bit()
-        });
-        devices.RCC.ahb4rstr.write(|w| {
-            w.gpioarst().set_bit()
-        });
-        devices.RCC.ahb4rstr.write(|w| {
-            w.gpioarst().clear_bit()
-        });
-
         // configure GPIO A9 to be hrtim output C1, push-pull
         devices.GPIOA.moder.modify(|_, w| {
             w.moder9().alternate()
@@ -206,10 +191,6 @@ pub fn init(config: Config) {
                 .pshpll().clear_bit()
                 .cont().set_bit()
                 .ck_pscx().variant(0b101)
-        });
-        // reset timer c on eev3
-        devices.HRTIM_TIMC.rstcr.modify(|_, w| {
-            w.extevnt3().set_bit()
         });
 
         // set timer c to go low on cmp1, and high on per and cmp2
@@ -276,6 +257,25 @@ pub fn init(config: Config) {
             w.cpt1c().set_bit()
         });
 
+        // configure timer d to delay external event 3
+        devices.HRTIM_TIMD.timdcr.modify(|_, w| {
+            w
+                .tx_rstu().set_bit()
+                .ck_pscx().variant(0b101)
+                .cont().clear_bit()
+                .retrig().set_bit()
+                .preen().set_bit()
+        });
+        devices.HRTIM_TIMD.rstdr.modify(|_, w| {
+            w.extevnt3().set_bit()
+        });
+        devices.HRTIM_TIMD.perdr.modify(|_, w| {
+            w.perx().variant(0xF000)
+        });
+        devices.HRTIM_TIMD.cmp1dr.modify(|_, w| {
+            w.cmp1x().variant(config.startup_period / 2 - config.delay_compensation)
+        });
+
         // configure GPIO A11 as input (!OCD)
         devices.GPIOA.moder.modify(|_, w| {
             w.moder11().input()
@@ -292,6 +292,13 @@ pub fn init(config: Config) {
         });
 
         *QCW_CONFIG.borrow(cs).borrow_mut() = config;
+        *QCW_STATE.borrow(cs).borrow_mut() = QcwState {
+            state: OperationState::Idle,
+            run_mode: None,
+            t0: 0,
+            period: 0,
+            phase_setpoint: 0.0,
+        }
     });
 
     unsafe {
@@ -317,18 +324,50 @@ fn compute_hrtim_channel_timings(period: u16, phase: f32) -> HrtimChannelTimings
     }
 }
 
-pub fn start(initial_period: u16, initial_phase: f32) {
+pub fn start(run_mode: RunMode) {
     with_devices_mut(|devices, cs| {
         let config = {*QCW_CONFIG.borrow(cs).borrow()};
 
-        let phase = initial_phase.clamp(config.phase_limit_low, config.phase_limit_high);
-        let period = initial_period / 2;
+        let (operation_state, phase) = match &run_mode {
+            RunMode::Burst { phase, .. } => (OperationState::Locking, *phase),
+            RunMode::Ramp { phase_t0, .. } => (OperationState::Locking, *phase_t0),
+            RunMode::Test { phase, time_us } => (OperationState::Running, *phase)
+        };
+
+        let period = config.startup_period;
 
         let mut state = QCW_STATE.borrow(cs).borrow_mut();
-        state.period = initial_period;
+        if state.state == OperationState::Overcurrent {
+            return;
+        }
+        state.period = period;
         state.phase_setpoint = phase;
+        state.run_mode = Some(run_mode);
+        state.state = operation_state;
+        state.t0 = 0;
 
-        set_period_phase(devices, period, phase, false);
+        begin_timer_update(devices);
+
+        set_period_phase(devices, period, phase, false, config.delay_compensation);
+
+        devices.HRTIM_TIMC.timccr.modify(|_, w| {
+            w.cont().set_bit()
+        });
+        devices.HRTIM_TIMA.timacr.modify(|_, w| {
+            w.cont().set_bit()
+        });
+
+        match operation_state {
+            OperationState::Locking => {
+                set_feedback_triggering_active(devices, false);
+            },
+            OperationState::Running => {
+                set_feedback_triggering_active(devices, true);
+            },
+            _ => {}
+        }
+
+        end_timer_update(devices);
 
         devices.HRTIM_COMMON.oenr.write(|w| {
             w
@@ -347,37 +386,88 @@ pub fn start(initial_period: u16, initial_phase: f32) {
     });
 }
 
-pub fn set_phase(phase: f32) {
-    let config = cortex_m::interrupt::free(|cs| {
-        *QCW_CONFIG.borrow(cs).borrow()
-    });
-    let phase = phase.clamp(config.phase_limit_low, config.phase_limit_high);
+fn set_feedback_triggering_active(devices: &mut Peripherals, active: bool) {
+    if active {
+        devices.HRTIM_TIMA.rstar.modify(|_, w| {
+            w.timdcmp1().set_bit()
+        });
+        devices.HRTIM_TIMC.rstcr.modify(|_, w| {
+            w.timdcmp1().set_bit()
+        });
+    } else {
+        devices.HRTIM_TIMA.rstar.modify(|_, w| {
+            w.timdcmp1().clear_bit()
+        });
+        devices.HRTIM_TIMC.rstcr.modify(|_, w| {
+            w.timdcmp1().clear_bit()
+        });
+    }
+}
+
+pub fn update() {
     with_devices_mut(|devices, cs| {
+        let config = *QCW_CONFIG.borrow(cs).borrow();
         let mut state = QCW_STATE.borrow(cs).borrow_mut();
-        state.phase_setpoint = phase;
-        let period = state.period;
-        set_period_phase(devices, period, phase, false);
+        match (state.state, state.run_mode) {
+            (OperationState::Idle, _) => {},
+            (OperationState::Locking, _) => {
+                if let Some(period) = read_frequency_detector() {
+                    if (state.period as i32 - period as i32).abs() <= config.allowed_period_deviation as i32 {
+
+                        state.period = period;
+                        state.state = OperationState::Running;
+                        
+                        begin_timer_update(devices);
+                        set_feedback_triggering_active(devices, true);
+                        set_period_phase(devices, period, state.phase_setpoint, false, config.delay_compensation);
+                        devices.HRTIM_TIMB.timbicr.write(|w| {
+                            w.cpt1c().set_bit()
+                        });
+                        end_timer_update(devices);
+
+                        unsafe { stm32h753::NVIC::unmask(interrupt::HRTIM_TIMB) };
+                    }
+                }
+            },
+            (OperationState::Running, Some(RunMode::Test { time_us, ..})) => {
+                // todo
+            },
+            (OperationState::Running, Some(RunMode::Burst { phase, time_us })) => {
+                // todo
+            },
+            (OperationState::Running, Some(RunMode::Ramp { time_us, phase_t0, phase_t1 })) => {
+                // todo
+            }
+            _ => {}
+        }
+    })
+}
+
+fn begin_timer_update(devices: &mut Peripherals) {
+    devices.HRTIM_COMMON.cr1.modify(|_, w| {
+        w
+            .taudis().set_bit()
+            .tcudis().set_bit()
+            .tdudis().set_bit()
     });
 }
 
-fn set_period_phase(devices: &mut Peripherals, period: u16, phase: f32, flip_phases: bool) {
-    let (phase_limit_low, phase_limit_high) = cortex_m::interrupt::free(|cs| {
-        let config = QCW_CONFIG.borrow(cs).borrow();
-        (config.phase_limit_low, config.phase_limit_high)
+fn end_timer_update(devices: &mut Peripherals) {
+    devices.HRTIM_COMMON.cr1.modify(|_, w| {
+        w
+            .taudis().clear_bit()
+            .tcudis().clear_bit()
+            .tdudis().clear_bit()
     });
-    let phase = phase.clamp(phase_limit_low, phase_limit_high);
+}
+
+fn set_period_phase(devices: &mut Peripherals, period: u16, phase: f32, flip_phases: bool, delay_compensation: u16) {
     let alpha_timings = compute_hrtim_channel_timings(period, 0.0);
     let beta_timings = compute_hrtim_channel_timings(period, 1.0 - phase);
     let (channel_a_timings, channel_c_timings) = match flip_phases {
         false => (alpha_timings, beta_timings ),
         true =>  (beta_timings,  alpha_timings),
     };
-
-    devices.HRTIM_COMMON.cr1.modify(|_, w| {
-        w
-            .taudis().set_bit()
-            .tcudis().set_bit()
-    });
 
     devices.HRTIM_TIMA.perar.modify(|_, w| {
         w.perx().variant(channel_a_timings.per)
@@ -399,28 +489,71 @@ fn set_period_phase(devices: &mut Peripherals, period: u16, phase: f32, flip_pha
         w.cmp2x().variant(channel_c_timings.cmp2)
     });
 
-    devices.HRTIM_COMMON.cr1.modify(|_, w| {
-        w
-            .taudis().clear_bit()
-            .tcudis().clear_bit()
+    devices.HRTIM_TIMD.cmp1dr.modify(|_, w| {
+        w.cmp1x().variant(period / 2 - delay_compensation)
     });
+}
+
+pub fn is_running() -> bool {
+    with_devices(|_, cs| {
+        let state = QCW_STATE.borrow(cs).borrow();
+        match state.state {
+           OperationState::Idle | OperationState::Overcurrent => false,
+           _ => true
+        }
+    })
+}
+
+pub fn overcurrent_status() -> bool {
+    with_devices(|devices, _| {
+        devices.GPIOA.idr.read().idr11().bit_is_clear()
+    })
+}
+
+pub fn clear_overcurrent() -> Result<(), ()> {
+    with_devices(|devices, cs| {
+        if devices.GPIOA.idr.read().idr11().bit_is_clear() {
+            Err(())
+        } else {
+            let mut state = QCW_STATE.borrow(cs).borrow_mut();
+            match state.state {
+                OperationState::Idle | OperationState::Overcurrent => {
+                    state.state = OperationState::Idle;
+                    Ok(())
+                },
+                _ => Err(())
+            }
+        }
+    })
+}
+
+fn read_frequency_detector() -> Option<u16> {
+    with_devices_mut(|devices, _| {
+        if devices.HRTIM_TIMB.timbisr.read().cpt1().bit_is_set() {
+            let period = devices.HRTIM_TIMB.cpt1br.read().cpt1x().bits();
+            devices.HRTIM_TIMB.timbicr.write(|w| {
+                w.cpt1c().set_bit()
+            });
+            Some(period)
+        } else {
+            None
+        }
+    })
 }
 
 #[interrupt]
 fn HRTIM_TIMB() {
     with_devices_mut(|devices, cs| {
-        //let config = {*QCW_CONFIG.borrow(cs).borrow()};
-        if devices.HRTIM_TIMB.timbisr.read().cpt1().bit_is_set() {
-            let measured_period = devices.HRTIM_TIMB.cpt1br.read().cpt1x().bits();
+        let config = {*QCW_CONFIG.borrow(cs).borrow()};
+        if let Some(period) = read_frequency_detector() {
             let mut state = QCW_STATE.borrow(cs).borrow_mut();
             //let deviation = measured_period as i32 - state.period as i32;
             //if deviation.abs() <= config.allowed_period_deviation as i32 {
-                set_period_phase(devices, measured_period, state.phase_setpoint, false);
-                state.period = measured_period;
+                begin_timer_update(devices);
+                set_period_phase(devices, period, state.phase_setpoint, false, config.delay_compensation);
+                end_timer_update(devices);
+                state.period = period;
             //}
-            devices.HRTIM_TIMB.timbicr.write(|w| {
-                w.cpt1c().set_bit()
-            });
         }
     });
 }
