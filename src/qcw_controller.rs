@@ -2,7 +2,7 @@ use cortex_m::{interrupt::Mutex, peripheral::nvic};
 use core::cell::RefCell;
 use stm32h7::stm32h753::{self, interrupt, Peripherals};
 
-use crate::device_access::{with_devices, with_devices_mut};
+use crate::{device_access::{with_devices, with_devices_mut}, time};
 
 #[derive(Copy, Clone, Debug)]
 pub struct Config {
@@ -19,7 +19,8 @@ static QCW_CONFIG: Mutex<RefCell<Config>> = Mutex::new(RefCell::new(Config {
 
 #[derive(Copy, Clone, Debug)]
 pub enum RunMode {
-    Test { phase: f32, time_us: u32 },
+    TestClosedLoop { phase: f32, time_us: u32 },
+    TestOpenLoop { phase: f32, time_us: u32 },
     Burst { phase: f32, time_us: u32 },
     Ramp { phase_t0: f32, phase_t1: f32, time_us: u32 },
 }
@@ -29,13 +30,14 @@ pub enum OperationState {
     Idle,
     Locking,
     Running,
+    RunningOpenLoop,
     Overcurrent,
 }
 
 struct QcwState {
     state: OperationState,
     run_mode: Option<RunMode>,
-    t0: u32,
+    t0: u64,
     period: u16,
     phase_setpoint: f32,
 }
@@ -300,10 +302,6 @@ pub fn init(config: Config) {
             phase_setpoint: 0.0,
         }
     });
-
-    unsafe {
-        cortex_m::peripheral::NVIC::unmask(interrupt::HRTIM_TIMB)
-    };
 }
 
 struct HrtimChannelTimings {
@@ -325,50 +323,49 @@ fn compute_hrtim_channel_timings(period: u16, phase: f32) -> HrtimChannelTimings
 }
 
 pub fn start(run_mode: RunMode) {
-    with_devices_mut(|devices, cs| {
+    let now = time::micros();
+    let enable_feedback_interrupt = with_devices_mut(|devices, cs| {
         let config = {*QCW_CONFIG.borrow(cs).borrow()};
 
         let (operation_state, phase) = match &run_mode {
             RunMode::Burst { phase, .. } => (OperationState::Locking, *phase),
             RunMode::Ramp { phase_t0, .. } => (OperationState::Locking, *phase_t0),
-            RunMode::Test { phase, time_us } => (OperationState::Running, *phase)
+            RunMode::TestClosedLoop { phase, ..  } => (OperationState::Running, *phase),
+            RunMode::TestOpenLoop { phase, ..  } => (OperationState::RunningOpenLoop, *phase)
         };
 
         let period = config.startup_period;
 
         let mut state = QCW_STATE.borrow(cs).borrow_mut();
         if state.state == OperationState::Overcurrent {
-            return;
+            return false;
         }
         state.period = period;
         state.phase_setpoint = phase;
         state.run_mode = Some(run_mode);
         state.state = operation_state;
-        state.t0 = 0;
+        state.t0 = now;
 
         begin_timer_update(devices);
 
         set_period_phase(devices, period, phase, false, config.delay_compensation);
+        set_phase_timers_active(devices, true);
 
-        devices.HRTIM_TIMC.timccr.modify(|_, w| {
-            w.cont().set_bit()
-        });
-        devices.HRTIM_TIMA.timacr.modify(|_, w| {
-            w.cont().set_bit()
-        });
-
-        match operation_state {
-            OperationState::Locking => {
+        let enable_feedback_interrupt = match operation_state {
+            OperationState::Locking | OperationState::RunningOpenLoop => {
                 set_feedback_triggering_active(devices, false);
+                false
             },
             OperationState::Running => {
                 set_feedback_triggering_active(devices, true);
+                true
             },
-            _ => {}
-        }
+            _ => false
+        };
 
         end_timer_update(devices);
 
+        
         devices.HRTIM_COMMON.oenr.write(|w| {
             w
                 .ta1oen().set_bit()
@@ -380,10 +377,47 @@ pub fn start(run_mode: RunMode) {
             .tacen().set_bit()
             .tccen().set_bit()
             .tbcen().set_bit()
+            .tdcen().set_bit()
             .sync_src().variant(0b10)
             .sync_out().variant(0)
         });
+        enable_feedback_interrupt
     });
+    set_feedback_interrupt_enabled(enable_feedback_interrupt);
+}
+
+fn set_feedback_interrupt_enabled(enabled: bool) {
+    if enabled {
+        unsafe { stm32h753::NVIC::unmask(interrupt::HRTIM_TIMB) };
+    } else {
+        stm32h753::NVIC::mask(interrupt::HRTIM_TIMB);
+    }
+}
+
+fn set_phase_timers_active(devices: &mut Peripherals, active: bool) {
+    if active {
+        devices.HRTIM_TIMC.timccr.modify(|_, w| {
+            w
+                .cont().set_bit()
+                .retrig().set_bit()
+        });
+        devices.HRTIM_TIMA.timacr.modify(|_, w| {
+            w
+                .cont().set_bit()
+                .retrig().set_bit()
+        });
+    } else {
+        devices.HRTIM_TIMC.timccr.modify(|_, w| {
+            w
+                .cont().clear_bit()
+                .retrig().clear_bit()
+        });
+        devices.HRTIM_TIMA.timacr.modify(|_, w| {
+            w
+                .cont().clear_bit()
+                .retrig().clear_bit()
+        });
+    }
 }
 
 fn set_feedback_triggering_active(devices: &mut Peripherals, active: bool) {
@@ -405,6 +439,7 @@ fn set_feedback_triggering_active(devices: &mut Peripherals, active: bool) {
 }
 
 pub fn update() {
+    let now = time::micros();
     with_devices_mut(|devices, cs| {
         let config = *QCW_CONFIG.borrow(cs).borrow();
         let mut state = QCW_STATE.borrow(cs).borrow_mut();
@@ -425,18 +460,38 @@ pub fn update() {
                         });
                         end_timer_update(devices);
 
-                        unsafe { stm32h753::NVIC::unmask(interrupt::HRTIM_TIMB) };
+                        set_feedback_interrupt_enabled(true);
                     }
                 }
             },
-            (OperationState::Running, Some(RunMode::Test { time_us, ..})) => {
-                // todo
+            (_, Some(RunMode::TestOpenLoop { time_us, .. }) | Some(RunMode::TestClosedLoop { time_us, .. })) => {
+                let time = now - state.t0;
+                if time >= time_us as u64 {
+                    begin_timer_update(devices);
+                    set_phase_timers_active(devices, false);
+                    end_timer_update(devices);
+                    state.state = OperationState::Idle;
+                    state.run_mode = None;
+                    set_feedback_interrupt_enabled(false);
+                }
             },
-            (OperationState::Running, Some(RunMode::Burst { phase, time_us })) => {
-                // todo
-            },
-            (OperationState::Running, Some(RunMode::Ramp { time_us, phase_t0, phase_t1 })) => {
-                // todo
+            (OperationState::Running, Some(RunMode::Burst { .. })) => {
+                // todo - for now, immediately disable
+                state.state = OperationState::Idle;
+                state.run_mode = None;
+                begin_timer_update(devices);
+                set_phase_timers_active(devices, false);
+                end_timer_update(devices);
+                set_feedback_interrupt_enabled(false);
+            }
+            (OperationState::Running, Some(RunMode::Ramp { .. })) => {
+                // todo - for now, immediately disable
+                state.state = OperationState::Idle;
+                state.run_mode = None;
+                begin_timer_update(devices);
+                set_phase_timers_active(devices, false);
+                end_timer_update(devices);
+                set_feedback_interrupt_enabled(false);
             }
             _ => {}
         }
@@ -547,20 +602,17 @@ fn HRTIM_TIMB() {
         let config = {*QCW_CONFIG.borrow(cs).borrow()};
         if let Some(period) = read_frequency_detector() {
             let mut state = QCW_STATE.borrow(cs).borrow_mut();
-            //let deviation = measured_period as i32 - state.period as i32;
-            //if deviation.abs() <= config.allowed_period_deviation as i32 {
-                begin_timer_update(devices);
-                set_period_phase(devices, period, state.phase_setpoint, false, config.delay_compensation);
-                end_timer_update(devices);
-                state.period = period;
-            //}
+            begin_timer_update(devices);
+            set_period_phase(devices, period, state.phase_setpoint, false, config.delay_compensation);
+            end_timer_update(devices);
+            state.period = period;
         }
     });
 }
 
 #[interrupt]
 fn EXTI15_10() {
-    with_devices_mut(|devices, cs| {
+    with_devices_mut(|devices, _| {
         if devices.EXTI.cpupr1.read().pr11().bit_is_set() {
             // OCD trigger
             devices.EXTI.cpupr1.modify(|_, w| {

@@ -32,23 +32,24 @@ fn main() -> ! {
     debug_led::set(true);
     time::init();
 
-    /*let qcw_config = qcw_controller::Config {
+    let qcw_config = qcw_controller::Config {
         delay_compensation: 0,
         startup_period: 500,
         allowed_period_deviation: 100,
-    };*/
-    //qcw_controller::init(qcw_config);
+    };
+    qcw_controller::init(qcw_config);
 
     unsafe { cortex_m::interrupt::enable() };
-    
-    //qcw_controller::start(qcw_controller::RunMode::Test { phase: 0.5, time_us: 1000 });
 
     loop {
-        //if !qcw_controller::is_running() {
-            // wait 50 ms
-        //    _ = qcw_controller::clear_overcurrent();
-        //    qcw_controller::start(qcw_controller::RunMode::Test { phase: 0.5, time_us: 1000 });
-        //}
+        if !qcw_controller::is_running() {
+            let t0 = time::micros();
+            while (time::micros() - t0) < 50 {}
+
+            //_ = qcw_controller::clear_overcurrent();
+            qcw_controller::start(qcw_controller::RunMode::TestOpenLoop { phase: 0.5, time_us: 1000 });
+        }
         debug_led::set(((time::micros() / 1000000) & 1) != 0);
+        qcw_controller::update();
     }
 }
