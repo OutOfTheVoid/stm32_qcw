@@ -262,11 +262,9 @@ pub fn init(config: Config) {
         // configure timer d to delay external event 3
         devices.HRTIM_TIMD.timdcr.modify(|_, w| {
             w
-                .tx_rstu().set_bit()
-                .ck_pscx().variant(0b101)
-                .cont().clear_bit()
-                .retrig().set_bit()
-                .preen().set_bit()
+            .ck_pscx().variant(0b101)
+            .cont().clear_bit()
+            .retrig().set_bit()
         });
         devices.HRTIM_TIMD.rstdr.modify(|_, w| {
             w.extevnt3().set_bit()
@@ -286,12 +284,12 @@ pub fn init(config: Config) {
             w.pupdr11().floating()
         });
         // setup gpio interrupt for a11
-        devices.SYSCFG.exticr3.modify(|_, w| {
+        /*devices.SYSCFG.exticr3.modify(|_, w| {
             w.exti11().variant(0)
         });
         devices.EXTI.ftsr1.modify(|_, w| {
             w.tr11().set_bit()
-        });
+        });*/
 
         *QCW_CONFIG.borrow(cs).borrow_mut() = config;
         *QCW_STATE.borrow(cs).borrow_mut() = QcwState {
@@ -330,7 +328,7 @@ pub fn start(run_mode: RunMode) {
         let (operation_state, phase) = match &run_mode {
             RunMode::Burst { phase, .. } => (OperationState::Locking, *phase),
             RunMode::Ramp { phase_t0, .. } => (OperationState::Locking, *phase_t0),
-            RunMode::TestClosedLoop { phase, ..  } => (OperationState::Running, *phase),
+            RunMode::TestClosedLoop { phase, ..  } => (OperationState::Locking, *phase),
             RunMode::TestOpenLoop { phase, ..  } => (OperationState::RunningOpenLoop, *phase)
         };
 
@@ -364,7 +362,6 @@ pub fn start(run_mode: RunMode) {
         };
 
         end_timer_update(devices);
-
         
         devices.HRTIM_COMMON.oenr.write(|w| {
             w
@@ -446,7 +443,7 @@ pub fn update() {
         match (state.state, state.run_mode) {
             (OperationState::Idle, _) => {},
             (OperationState::Locking, _) => {
-                if let Some(period) = read_frequency_detector() {
+                if let Some(period) = read_frequency_detector(devices) {
                     if (state.period as i32 - period as i32).abs() <= config.allowed_period_deviation as i32 {
 
                         state.period = period;
@@ -467,31 +464,32 @@ pub fn update() {
             (_, Some(RunMode::TestOpenLoop { time_us, .. }) | Some(RunMode::TestClosedLoop { time_us, .. })) => {
                 let time = now - state.t0;
                 if time >= time_us as u64 {
+                    set_feedback_interrupt_enabled(false);
                     begin_timer_update(devices);
+                    set_feedback_triggering_active(devices, false);
                     set_phase_timers_active(devices, false);
                     end_timer_update(devices);
                     state.state = OperationState::Idle;
                     state.run_mode = None;
-                    set_feedback_interrupt_enabled(false);
                 }
             },
             (OperationState::Running, Some(RunMode::Burst { .. })) => {
                 // todo - for now, immediately disable
                 state.state = OperationState::Idle;
                 state.run_mode = None;
+                set_feedback_interrupt_enabled(false);
                 begin_timer_update(devices);
                 set_phase_timers_active(devices, false);
                 end_timer_update(devices);
-                set_feedback_interrupt_enabled(false);
             }
             (OperationState::Running, Some(RunMode::Ramp { .. })) => {
                 // todo - for now, immediately disable
                 state.state = OperationState::Idle;
                 state.run_mode = None;
+                set_feedback_interrupt_enabled(false);
                 begin_timer_update(devices);
                 set_phase_timers_active(devices, false);
                 end_timer_update(devices);
-                set_feedback_interrupt_enabled(false);
             }
             _ => {}
         }
@@ -582,25 +580,23 @@ pub fn clear_overcurrent() -> Result<(), ()> {
     })
 }
 
-fn read_frequency_detector() -> Option<u16> {
-    with_devices_mut(|devices, _| {
-        if devices.HRTIM_TIMB.timbisr.read().cpt1().bit_is_set() {
-            let period = devices.HRTIM_TIMB.cpt1br.read().cpt1x().bits();
-            devices.HRTIM_TIMB.timbicr.write(|w| {
-                w.cpt1c().set_bit()
-            });
-            Some(period)
-        } else {
-            None
-        }
-    })
+fn read_frequency_detector(devices: &mut Peripherals) -> Option<u16> {
+    if devices.HRTIM_TIMB.timbisr.read().cpt1().bit_is_set() {
+        let period = devices.HRTIM_TIMB.cpt1br.read().cpt1x().bits();
+        devices.HRTIM_TIMB.timbicr.write(|w| {
+            w.cpt1c().set_bit()
+        });
+        Some(period)
+    } else {
+        None
+    }
 }
 
 #[interrupt]
 fn HRTIM_TIMB() {
     with_devices_mut(|devices, cs| {
         let config = {*QCW_CONFIG.borrow(cs).borrow()};
-        if let Some(period) = read_frequency_detector() {
+        if let Some(period) = read_frequency_detector(devices) {
             let mut state = QCW_STATE.borrow(cs).borrow_mut();
             begin_timer_update(devices);
             set_period_phase(devices, period, state.phase_setpoint, false, config.delay_compensation);

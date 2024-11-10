@@ -33,7 +33,7 @@ fn main() -> ! {
     time::init();
 
     let qcw_config = qcw_controller::Config {
-        delay_compensation: 0,
+        delay_compensation: 10,
         startup_period: 500,
         allowed_period_deviation: 100,
     };
@@ -47,7 +47,7 @@ fn main() -> ! {
             while (time::micros() - t0) < 50 {}
 
             //_ = qcw_controller::clear_overcurrent();
-            qcw_controller::start(qcw_controller::RunMode::TestOpenLoop { phase: 0.5, time_us: 1000 });
+            qcw_controller::start(qcw_controller::RunMode::TestClosedLoop { phase: 1.0, time_us: 1000 });
         }
         debug_led::set(((time::micros() / 1000000) & 1) != 0);
         qcw_controller::update();
