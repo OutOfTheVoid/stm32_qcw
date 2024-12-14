@@ -1,4 +1,4 @@
-use stm32h7::stm32h753::{Peripherals};
+use stm32h7::stm32h753::Peripherals;
 
 /*
 Setup the system pll to generate the high frequency bus clock the HRTIM peripheral needs
@@ -14,7 +14,7 @@ pub enum SystemPllSpeed {
     MHz400,
 }
 
-pub fn setup_system_pll(peripherals: &Peripherals, speed: SystemPllSpeed) {
+pub fn setup_system_pll(peripherals: &mut Peripherals, speed: SystemPllSpeed) {
     unsafe {
         peripherals.RCC.cr.modify(|_, w| {
             w
@@ -89,10 +89,15 @@ pub fn switch_cpu_to_system_pll(peripherals: &Peripherals) {
             // set system peripheral clock divider to 2
             .hpre().div2()
     });
+
+    peripherals.RCC.d2cfgr.modify(|_, w| {
+        w.d2ppre1().div1()
+    });
     
     peripherals.RCC.cfgr.modify(|_, w| {
         // set the system clock to pll1
         w.sw().pll1()
+        .hrtimsel().c_ck()
     });
     loop {
         
