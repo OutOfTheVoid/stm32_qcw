@@ -9,3 +9,4 @@ features = ["stm32h753"]
 cortex-m-rt = "*"
 cortex-m = "*"
 panic-halt = "*"
+libm = "0.2.11"

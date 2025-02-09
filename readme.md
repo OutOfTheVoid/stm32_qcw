@@ -3,19 +3,20 @@ STM32 QCWDRSSTC Controller
 
 Pin mappings:
 -------------
-* C6 - phase 1 output
-* A9 - phase 2 output
+* C6  - phase 1 non-inverted output
+* C7  - phase 1 inverted output
+* A9  - phase 2 non-inverted output
+* A10 - phase 2 inverted output
+* C5  - feedback input
 
 Progress
 --------
-* Phase shifted square waves at set frequency
+* Consistently locking phase locked loop
+* Controllable conduction angle
 
 Todo
 ----
-* Gate driver enable output
-* Input capture based feedback
-* Input phase adjustment
+* low-power Frequency sweep for finding initial resonance
 * Overcurrent protection
 * General controllability
 * Serial/Fiber communication
-

@@ -375,7 +375,7 @@ pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig
             });
 
             let half_period = period_clocks / 2;
-            let quarter_period = half_period / 2;
+            let quarter_period = half_period / 8;
 
             // setup timings for the periodic timer
             devices.HRTIM_TIMB.cmp1br.modify(|_, w| {
@@ -426,7 +426,6 @@ pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig
             });
 
             // set the timings for the output timers and their triggers
-
             let half_period = period_clocks / 2;
 
             devices.HRTIM_TIMA.cmp1ar.modify(|_, w| w.cmp1x().variant(half_period));

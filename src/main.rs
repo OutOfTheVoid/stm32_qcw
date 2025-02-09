@@ -5,20 +5,29 @@ extern crate panic_halt;
 extern crate cortex_m_rt;
 extern crate cortex_m;
 extern crate stm32h7;
+extern crate libm;
 
 use core::u16;
+use libm::{asinf, powf};
 
 use cortex_m_rt::entry;
 use device_access::{set_devices, with_devices_mut};
 use pll_setup::{setup_system_pll, switch_cpu_to_system_pll};
 use stm32h7::stm32h753;
-use time::{block_micros, block_millis};
+use time::block_millis;
 
 mod pll_setup;
 mod time;
 mod device_access;
 mod debug_led;
 mod qcw;
+
+const ZERO_ANGLE: f32 = 0.05f32;
+const STARTUP_TIME_US: u64 = 40;
+const TOTAL_TIME_US: u64 = 12000;
+const STARTUP_PERIOD: u16 = 650;
+const PERIOD_OFFSET_MAX: u16 = 100;
+const STARTUP_CONDUCTION_ANGLE: f32 = 0.2;
 
 #[entry]
 fn main() -> ! {
@@ -36,18 +45,13 @@ fn main() -> ! {
     unsafe { cortex_m::interrupt::enable() };
 
     let mut feedback_values: [u16; 3] = [0; 3];
-
-    let mut zero_angle = 0.05f32;
+    let mut t_closed_loop_start: u64 = 0;
 
     loop {
-        let STARTUP_TIME_US: u64 = 60;
-        let TOTAL_TIME_US: u64 = 400;
-        let STARTUP_PERIOD: u16 = 666;
-        let PERIOD_OFFSET_MAX: u16 = 100;
 
         feedback_values.fill(0);
         let t0 = time::micros();
-        with_devices_mut(|devices, _| qcw::configure_signal_path(devices, qcw::SignalPathConfig::OpenLoop { period_clocks: STARTUP_PERIOD, conduction_angle: 0.3 }));
+        with_devices_mut(|devices, _| qcw::configure_signal_path(devices, qcw::SignalPathConfig::OpenLoop { period_clocks: STARTUP_PERIOD, conduction_angle: STARTUP_CONDUCTION_ANGLE }));
         
         // spend some time in open loop mode to ring up the primary
         loop {
@@ -80,13 +84,14 @@ fn main() -> ! {
                             feedback_value_total += *v as u32;
                         }
                         feedback_value_total /= feedback_values.len() as u32;
-                        qcw::configure_signal_path(devices, qcw::SignalPathConfig::ClosedLoop { period_clocks: feedback_value_total as u16, conduction_angle: 0.5, zero_angle, delay_comp: 0 });
+                        qcw::configure_signal_path(devices, qcw::SignalPathConfig::ClosedLoop { period_clocks: feedback_value_total as u16, conduction_angle: STARTUP_CONDUCTION_ANGLE, zero_angle: ZERO_ANGLE, delay_comp: 0 });
                         return true
                     }
                 }
                 false
             });
             if closed_loop {
+                t_closed_loop_start = now;
                 break;
             }
         };
@@ -94,6 +99,10 @@ fn main() -> ! {
         // now we're in closed loop
         loop {
             let now = time::micros();
+            let duration_closed_loop = TOTAL_TIME_US - (t_closed_loop_start - t0);
+            let t_closed_loop = now - t_closed_loop_start;
+            let closed_loop_fraction = t_closed_loop as f32 / duration_closed_loop as f32;
+            let conduction_angle = feedback_ramp(closed_loop_fraction) * (0.5 - STARTUP_CONDUCTION_ANGLE) + STARTUP_CONDUCTION_ANGLE;
             if now - t0 >= TOTAL_TIME_US {
                 with_devices_mut(|devices, _| {
                     qcw::configure_signal_path(devices, qcw::SignalPathConfig::Disabled);
@@ -103,13 +112,13 @@ fn main() -> ! {
             }
             with_devices_mut(|devices, _| {
                 if let Some(value) = qcw::read_capture_timer(devices) {
-                    qcw::configure_signal_path(devices, qcw::SignalPathConfig::ClosedLoop { period_clocks: value, conduction_angle: 0.5, zero_angle, delay_comp: 0 });
+                    qcw::configure_signal_path(devices, qcw::SignalPathConfig::ClosedLoop { period_clocks: value, conduction_angle, zero_angle: ZERO_ANGLE, delay_comp: 0 });
                 }
             });
         }
         with_devices_mut(|devices, _| qcw::configure_signal_path(devices, qcw::SignalPathConfig::Disabled));
 
-        block_millis(100);
+        block_millis(500);
     }
 }
 
@@ -121,4 +130,8 @@ fn feedback_variance_acceptable(allowed_deviation: u16, min_period: u16, feedbac
         max = max.max(*v);
     }
     min > min_period && (max - min) < allowed_deviation
+}
+
+fn feedback_ramp(t: f32) -> f32 {
+    t
 }
