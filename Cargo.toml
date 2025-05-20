@@ -12,4 +12,4 @@ cortex-m = {version = "*", features = ["critical-section-single-core"]}
 panic-halt = "*"
 libm = "0.2.11"
 embedded-alloc = "0.6"
-qcw_com = { path = "../qcw_com" }
+qcw_com = { git = "https://github.com/OutOfTheVoid/qcw_com.git", branch = "main" }
