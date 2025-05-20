@@ -83,7 +83,7 @@ pub fn get_raw() -> u16 {
 }
 
 pub fn get_current() -> f32 {
-    (get_raw() as f32 - 80.4) / 5.408
+    (get_raw() as f32 - 80.4) / 10.816
 }
 
 //   3A = ~904
