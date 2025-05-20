@@ -345,7 +345,7 @@ pub fn read_capture_timer(devices: &mut Peripherals) -> Option<u16> {
 pub enum SignalPathConfig {
     Disabled,
     OpenLoop { period_clocks: u16, conduction_angle: f32 },
-    ClosedLoop { period_clocks: u16, conduction_angle: f32, zero_angle: f32, delay_comp: u16 },
+    ClosedLoop { period_clocks: u16, conduction_angle: f32, delay_compensation_clocks: i16 }
 }
 
 pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig) {
@@ -368,6 +368,9 @@ pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig
                 degrees respectively, providing a 90 degree conduction angle. This means
                 hard switching, but in theory allows a more forgiving frequency match.
             */
+            // disable timer b updates
+            devices.HRTIM_COMMON.cr1.modify(|_, w| w.tbudis().set_bit());
+            // continuous mode, retriggerable, fixed period
             devices.HRTIM_TIMB.timbcr.modify(|_, w| {
                 w
                     .cont().set_bit()
@@ -375,28 +378,18 @@ pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig
             });
 
             let half_period = period_clocks / 2;
-            let quarter_period = half_period / 8;
+            devices.HRTIM_TIMB.perbr.modify(|_, w| w.perx().variant(period_clocks));
 
             // setup timings for the periodic timer
-            devices.HRTIM_TIMB.cmp1br.modify(|_, w| {
-                w.cmp1x().variant(quarter_period)
-            });
-            devices.HRTIM_TIMB.cmp2br.modify(|_, w| {
-                w.cmp2x().variant(quarter_period + (half_period as f32 * conduction_angle) as u16)
-            });
-            devices.HRTIM_TIMB.perbr.modify(|_, w| {
-                w.perx().variant(period_clocks)
-            });
+            devices.HRTIM_TIMB.cmp1br.modify(|_, w| w.cmp1x().variant(half_period));
+            devices.HRTIM_TIMB.cmp2br.modify(|_, w| w.cmp2x().variant(half_period + (half_period as f32 * (1.0 - conduction_angle)) as u16));
 
             // setup timings for the output timers
-            devices.HRTIM_TIMA.cmp1ar.modify(|_, w| {
-                w.cmp1x().variant(half_period)
-            });
-            devices.HRTIM_TIMC.cmp1cr.modify(|_, w| {
-                w.cmp1x().variant(half_period)
-            });
+            devices.HRTIM_TIMA.cmp1ar.modify(|_, w| w.cmp1x().variant(half_period));
+            devices.HRTIM_TIMC.cmp1cr.modify(|_, w| w.cmp1x().variant(half_period));
 
             // update and reset it
+            devices.HRTIM_COMMON.cr1.modify(|_, w| w.tbudis().clear_bit());
             devices.HRTIM_COMMON.cr2.modify(|_, w| {
                 w
                     .tbrst().set_bit()
@@ -404,42 +397,48 @@ pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig
             });
 
             // and enable it
-            devices.HRTIM_MASTER.mcr.modify(|_, w| {
-                w.tbcen().set_bit()
-            });
+            devices.HRTIM_MASTER.mcr.modify(|_, w| w.tbcen().set_bit());
         },
-        SignalPathConfig::ClosedLoop { period_clocks, conduction_angle, zero_angle, delay_comp } => {
-            // disable updates to timer b while we modify it
-            devices.HRTIM_COMMON.cr1.modify(|_, w| {
-                w.tbudis().set_bit()
-            });
-
-            // setup timer-b to be triggered by the feedback input, rather than continuously looping
-            devices.HRTIM_TIMB.rstbr.modify(|_, w| {
-                w.extevnt3().set_bit()
-            });
-            devices.HRTIM_TIMB.timbcr.modify(|_, w| {
-                w.cont().clear_bit()
-            });
-            devices.HRTIM_TIMB.perbr.modify(|_, w| {
-                w.perx().variant(0xF000)
-            });
-
-            // set the timings for the output timers and their triggers
+        SignalPathConfig::ClosedLoop { period_clocks, conduction_angle, delay_compensation_clocks } => {
             let half_period = period_clocks / 2;
 
+            // disable timer b updates
+            devices.HRTIM_COMMON.cr1.modify(|_, w| w.tbudis().set_bit());
+            // reset on external event 3 (feedback high edge)
+            devices.HRTIM_TIMB.rstbr.modify(|_, w| w.extevnt3().set_bit());
+            // retriggerable, not continuous
+            devices.HRTIM_TIMB.timbcr.modify(|_, w| {
+                w
+                    .retrig().set_bit()
+                    .cont().clear_bit()
+            });
+            // set the period to something larger than a cycle
+            devices.HRTIM_TIMB.perbr.modify(|_, w| w.perx().variant(0xF000));
+
+            // compute phase delays
+            let phase_a_delay = half_period as i32 + delay_compensation_clocks as i32;
+            let phase_b_delay = half_period as i32 + delay_compensation_clocks as i32;// + (half_period as f32 * (1.0 - conduction_angle)) as i32;
+
+            // setup output timers to be period at operating frequency
             devices.HRTIM_TIMA.cmp1ar.modify(|_, w| w.cmp1x().variant(half_period));
             devices.HRTIM_TIMC.cmp1cr.modify(|_, w| w.cmp1x().variant(half_period));
 
-            let zero_delay = (period_clocks as f32 * zero_angle) as u16 - delay_comp;
+            // setup timer b to trigger our output timers periodically (with a phase delay for phase b)
+            // for symmetric phase delay, could subtract half the delay from a, and add half the delay to b, but for now lets keep it simple
+            devices.HRTIM_TIMB.cmp1br.modify(|_, w| w.cmp1x().variant(phase_a_delay as u16));
+            devices.HRTIM_TIMB.cmp2br.modify(|_, w| w.cmp2x().variant(phase_b_delay as u16));
 
-            devices.HRTIM_TIMB.cmp1br.modify(|_, w| w.cmp1x().variant(zero_delay));
-            devices.HRTIM_TIMB.cmp2br.modify(|_, w| w.cmp2x().variant(zero_delay + (period_clocks as f32 * conduction_angle) as u16));
-
-            // re-enable updates to start doing them!
-            devices.HRTIM_COMMON.cr1.modify(|_, w| {
-                w.tbudis().clear_bit()
+            // update and reset it
+            // and reset the feedback timer
+            devices.HRTIM_COMMON.cr1.modify(|_, w| w.tbudis().clear_bit());
+            devices.HRTIM_COMMON.cr2.modify(|_, w| {
+                w
+                    .tbswu().set_bit()
+                    .tdrst().set_bit()
             });
+
+            // and enable it
+            devices.HRTIM_MASTER.mcr.modify(|_, w| w.tbcen().set_bit());
         }
     }
 }

@@ -31,8 +31,18 @@ pub fn set(state: bool) {
     })
 }
 
+pub fn get() -> bool {
+    with_devices_mut(|devices, _| {
+        get_with_devices(devices)
+    })
+}
+
 pub fn set_with_devices(devices: &mut Peripherals, state: bool) {
     devices.GPIOC.odr.modify(|_, w| {
         w.odr13().bit(!state)
     });
+}
+
+pub fn get_with_devices(devices: &mut Peripherals) -> bool {
+    devices.GPIOC.odr.read().odr13().bit_is_clear()
 }

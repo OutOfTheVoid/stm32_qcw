@@ -7,30 +7,65 @@ extern crate cortex_m;
 extern crate stm32h7;
 extern crate libm;
 
-use core::u16;
-use libm::{asinf, powf};
-
+use alloc::collections::vec_deque::VecDeque;
 use cortex_m_rt::entry;
 use device_access::{set_devices, with_devices_mut};
 use pll_setup::{setup_system_pll, switch_cpu_to_system_pll};
+use qcw::SignalPathConfig;
+use crate::serial_link::{SerialLink, SerialMailbox};
+use qcw_com::*;
 use stm32h7::stm32h753;
-use time::block_millis;
 
 mod pll_setup;
 mod time;
 mod device_access;
 mod debug_led;
 mod qcw;
+mod serial_link;
+mod current_monitor;
 
-const ZERO_ANGLE: f32 = 0.05f32;
-const STARTUP_TIME_US: u64 = 40;
-const TOTAL_TIME_US: u64 = 12000;
-const STARTUP_PERIOD: u16 = 650;
-const PERIOD_OFFSET_MAX: u16 = 100;
-const STARTUP_CONDUCTION_ANGLE: f32 = 0.2;
+extern crate alloc;
+use embedded_alloc::LlffHeap as Heap;
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
+
+pub struct QcwParameters {
+    pub delay_compensation_ns: i16,
+    pub startup_frequency_khz: f32,
+
+    pub run_mode: RunMode,
+
+    pub ontime_us: u64,
+    pub offtime_ms: u64,
+
+    pub startup_time_us: u64,
+    pub lock_time_us: u64,
+    pub min_lock_current: f32,
+
+    pub current_limit: f32,
+
+    pub ramp_start_power: f32,
+    pub ramp_end_power: f32,
+    pub flat_power: f32,
+}
+
+pub struct QcwStats {
+    pub max_primary_current: f32,
+    pub feedback_frequency_khz: f32,
+}
+
+const REMOTE_TIMEOUT_US: u64 = 100_000;
 
 #[entry]
 fn main() -> ! {
+    {
+        use core::mem::MaybeUninit;
+        const HEAP_SIZE: usize = 8192;
+        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+        unsafe { HEAP.init(&raw mut HEAP_MEM as usize, HEAP_SIZE) }
+    }
+
     set_devices(stm32h753::Peripherals::take().unwrap());
 
     with_devices_mut(|devices, _| {
@@ -41,97 +76,237 @@ fn main() -> ! {
     debug_led::init();
     time::init();
     qcw::init();
+    current_monitor::init();
+
+    let mut t_last_keepalive = time::micros();
+
+    let mut qcw_params = QcwParameters {
+        delay_compensation_ns: 0,
+        startup_frequency_khz: 600.0,
+
+        run_mode: RunMode::OpenLoop,
+
+        ontime_us: 100,
+        offtime_ms: 1000,
+
+        startup_time_us: 2,
+        lock_time_us: 20,
+        min_lock_current: 0.0,
+
+        ramp_start_power: 0.1,
+        ramp_end_power: 0.4,
+        flat_power: 0.3,
+
+        current_limit: 1000.0,
+    };
+
+    let mut qcw_stats = QcwStats {
+        max_primary_current: 0.0,
+        feedback_frequency_khz: 0.0,
+    };
+
+    let mut running = false;
+    let mut on = false;
+    let mut t_state_start = 0;
 
     unsafe { cortex_m::interrupt::enable() };
 
-    let mut feedback_values: [u16; 3] = [0; 3];
-    let mut t_closed_loop_start: u64 = 0;
+    let mut link = SerialLink::new();
+
+    let mut inbox = VecDeque::new();
+    let mut outbox = VecDeque::new();
+
+    let mut last_feedback_measurement = None;
 
     loop {
+        let t_now = time::micros();
+        let primary_current = current_monitor::get_current();
+        let feedback_measurement = with_devices_mut(|devices, _| {
+            qcw::read_capture_timer(devices)
+        });
 
-        feedback_values.fill(0);
-        let t0 = time::micros();
-        with_devices_mut(|devices, _| qcw::configure_signal_path(devices, qcw::SignalPathConfig::OpenLoop { period_clocks: STARTUP_PERIOD, conduction_angle: STARTUP_CONDUCTION_ANGLE }));
-        
-        // spend some time in open loop mode to ring up the primary
-        loop {
-            let now = time::micros();
-            if now - t0 >= STARTUP_TIME_US {
-                break;
-            }
+        if feedback_measurement.is_some() {
+            last_feedback_measurement = feedback_measurement.clone();
         }
 
-        // then try and lock the loop
-        loop {
-            let now = time::micros();
-            if now - t0 >= TOTAL_TIME_US {
-                with_devices_mut(|devices, _| {
-                    qcw::configure_signal_path(devices, qcw::SignalPathConfig::Disabled);
-                    debug_led::set_with_devices(devices, false);
-                });
-                break;
+        let dt_last_keepalive = t_now - t_last_keepalive;
+
+        if running {
+            let stop = 
+                (primary_current >= qcw_params.current_limit) ||
+                (dt_last_keepalive >= REMOTE_TIMEOUT_US);
+            if stop {
+                running = false;
             }
-            let closed_loop = with_devices_mut(|devices, _| {
-                if let Some(value) = qcw::read_capture_timer(devices) {
-                    for i in (1..feedback_values.len()).rev() {
-                        feedback_values[i] = feedback_values[i - 1];
-                    }
-                    feedback_values[0] = value;
-                    if feedback_variance_acceptable(PERIOD_OFFSET_MAX, STARTUP_PERIOD, &feedback_values[..]) {
-                        debug_led::set_with_devices(devices, true);
-                        let mut feedback_value_total = 0;
-                        for v in feedback_values.iter() {
-                            feedback_value_total += *v as u32;
-                        }
-                        feedback_value_total /= feedback_values.len() as u32;
-                        qcw::configure_signal_path(devices, qcw::SignalPathConfig::ClosedLoop { period_clocks: feedback_value_total as u16, conduction_angle: STARTUP_CONDUCTION_ANGLE, zero_angle: ZERO_ANGLE, delay_comp: 0 });
-                        return true
-                    }
-                }
-                false
-            });
-            if closed_loop {
-                t_closed_loop_start = now;
-                break;
-            }
+        }
+        update_runmode(&qcw_params, running, &mut on, t_now, &mut t_state_start, last_feedback_measurement.clone());
+
+        qcw_stats.max_primary_current = qcw_stats.max_primary_current.max(primary_current);
+        if let Some(measurement) = feedback_measurement {
+            let frequency = 400_000.0 / measurement as f32;
+            qcw_stats.feedback_frequency_khz = frequency
+        }
+
+        let mailbox = SerialMailbox {
+            inbox: &mut inbox,
+            outbox: &mut outbox,
         };
-
-        // now we're in closed loop
-        loop {
-            let now = time::micros();
-            let duration_closed_loop = TOTAL_TIME_US - (t_closed_loop_start - t0);
-            let t_closed_loop = now - t_closed_loop_start;
-            let closed_loop_fraction = t_closed_loop as f32 / duration_closed_loop as f32;
-            let conduction_angle = feedback_ramp(closed_loop_fraction) * (0.5 - STARTUP_CONDUCTION_ANGLE) + STARTUP_CONDUCTION_ANGLE;
-            if now - t0 >= TOTAL_TIME_US {
-                with_devices_mut(|devices, _| {
-                    qcw::configure_signal_path(devices, qcw::SignalPathConfig::Disabled);
-                    debug_led::set_with_devices(devices, false);
-                });
-                break;
-            }
-            with_devices_mut(|devices, _| {
-                if let Some(value) = qcw::read_capture_timer(devices) {
-                    qcw::configure_signal_path(devices, qcw::SignalPathConfig::ClosedLoop { period_clocks: value, conduction_angle, zero_angle: ZERO_ANGLE, delay_comp: 0 });
+        _ = link.update(mailbox);
+        while let Some(message) = inbox.pop_front() {
+            match message {
+                ControllerMessage::SetDebugLed(state) => debug_led::set(state),
+                ControllerMessage::Ping(seq) => {
+                    outbox.push_back(RemoteMessage::Ping(seq));
+                },
+                ControllerMessage::SetParam(param_value) => {
+                    match param_value {
+                        ParameterValue::DelayCompensationNS(value) =>
+                            qcw_params.delay_compensation_ns = value,
+                        ParameterValue::StartupFrequencykHz(frequency) =>
+                            qcw_params.startup_frequency_khz = frequency,
+                        ParameterValue::RunMode(run_mode) =>
+                            qcw_params.run_mode = run_mode,
+                        ParameterValue::OnTimeUs(on_time) =>
+                            qcw_params.ontime_us = on_time as u64,
+                        ParameterValue::OffTimeMs(off_time) =>
+                            qcw_params.offtime_ms = off_time as u64,
+                        ParameterValue::StartupTimeUs(startup_time) =>
+                            qcw_params.startup_time_us = startup_time as u64,
+                        ParameterValue::LockTimeUs(lock_time) =>
+                            qcw_params.lock_time_us = lock_time as u64,
+                        ParameterValue::RampStartPower(power) =>
+                            qcw_params.ramp_start_power = power,
+                        ParameterValue::RampEndPower(power) =>
+                            qcw_params.ramp_end_power = power,
+                        ParameterValue::MinLockCurrentA(current) =>
+                            qcw_params.min_lock_current = current,
+                        ParameterValue::CurrentLimitA(current) =>
+                            qcw_params.current_limit = current,
+                        ParameterValue::FlatPower(power) =>
+                            qcw_params.flat_power = power,
+                    }
                 }
-            });
+                ControllerMessage::GetParam(param) => {
+                    let param_value= match param {
+                        Parameter::DelayCompensation => Some(ParameterValue::DelayCompensationNS(qcw_params.delay_compensation_ns)),
+                        Parameter::StartupFrequency => Some(ParameterValue::StartupFrequencykHz(qcw_params.startup_frequency_khz)),
+                        Parameter::RunMode => Some(ParameterValue::RunMode(qcw_params.run_mode)),
+                        Parameter::OnTime => Some(ParameterValue::OnTimeUs(qcw_params.ontime_us as u16)),
+                        Parameter::OffTime => Some(ParameterValue::OffTimeMs(qcw_params.offtime_ms as u16)),
+                        Parameter::StartupTime => Some(ParameterValue::StartupTimeUs(qcw_params.startup_time_us as u16)),
+                        Parameter::LockTime => Some(ParameterValue::LockTimeUs(qcw_params.lock_time_us as u16)),
+                        Parameter::RampStartPower => Some(ParameterValue::RampStartPower(qcw_params.ramp_start_power)),
+                        Parameter::RampEndPower => Some(ParameterValue::RampEndPower(qcw_params.ramp_end_power)),
+                        Parameter::MinLockCurrent => Some(ParameterValue::MinLockCurrentA(qcw_params.min_lock_current)),
+                        Parameter::CurrentLimit => Some(ParameterValue::CurrentLimitA(qcw_params.current_limit)),
+                        Parameter::FlatPower => Some(ParameterValue::FlatPower(qcw_params.flat_power)),
+                    };
+                    if let Some(value) = param_value {
+                        outbox.push_back(RemoteMessage::GetParamResult(value));
+                    };
+                }
+                ControllerMessage::GetStat(stat) => {
+                    let stat_value = match stat {
+                        Statistic::MaxPrimaryCurrent => StatisticValue::MaxPrimaryCurrentA(qcw_stats.max_primary_current),
+                        Statistic::FeedbackFrequency => StatisticValue::FeedbackFrequencykHz(qcw_stats.feedback_frequency_khz),
+                    };
+                    outbox.push_back(RemoteMessage::GetStatResult(stat_value));
+                },
+                ControllerMessage::KeepAlive => {
+                    t_last_keepalive = t_now;
+                },
+                ControllerMessage::Run => {
+                    t_state_start = t_now;
+                    t_last_keepalive = t_now;
+                    on = false;
+                    running = true;
+                },
+                ControllerMessage::Stop => {
+                    running = false;
+                },
+                ControllerMessage::ResetStats => {
+                    qcw_stats = QcwStats {
+                        max_primary_current: 0.0,
+                        feedback_frequency_khz: 0.0
+                    }
+                },
+                _ => {},
+            }
         }
-        with_devices_mut(|devices, _| qcw::configure_signal_path(devices, qcw::SignalPathConfig::Disabled));
-
-        block_millis(500);
     }
+    //loop {}
 }
 
-fn feedback_variance_acceptable(allowed_deviation: u16, min_period: u16, feedback_values: &[u16]) -> bool {
-    let mut min = u16::MAX;
-    let mut max = u16::MIN;
-    for v in feedback_values.iter() {
-        min = min.min(*v);
-        max = max.max(*v);
+fn update_runmode(qcw_params: &QcwParameters, running: bool, on: &mut bool, t_now: u64, t_state_start: &mut u64, feedback_measurement: Option<u16>) {
+    if running {
+        match qcw_params.run_mode {
+            RunMode::TestClosedLoop => {
+                match *on {
+                    true => {
+                        let dt_state = t_now - *t_state_start;
+                        if dt_state >= qcw_params.ontime_us {
+                            debug_led::set(false);
+                            with_devices_mut(|devices, _| {
+                                qcw::configure_signal_path(devices, SignalPathConfig::Disabled);
+                            });
+                            *t_state_start = t_now;
+                            *on = false;
+                        } else {
+                            if let Some(measurement) = feedback_measurement {
+                                debug_led::set(true);
+                                with_devices_mut(|devices, _| {
+                                    qcw::configure_signal_path(devices, SignalPathConfig::ClosedLoop {
+                                        period_clocks: measurement,
+                                        conduction_angle: qcw_params.flat_power,
+                                        delay_compensation_clocks: ((qcw_params.delay_compensation_ns as i64 * 400_000_000) / 1_000_000_000) as i16,
+                                    });
+                                });
+                            }
+                        }
+                    },
+                    false => {
+                        let dt_state = t_now - *t_state_start;
+                        if dt_state >= qcw_params.offtime_ms * 1000 {
+                            *t_state_start = t_now;
+                            *on = true;
+                        }
+                    }
+                }
+            },
+            RunMode::OpenLoop => {
+                match *on {
+                    true => {
+                        let dt_state = t_now - *t_state_start;
+                        if dt_state >= qcw_params.ontime_us {
+                            with_devices_mut(|devices, _| {
+                                qcw::configure_signal_path(devices, SignalPathConfig::Disabled);
+                            });
+                            *t_state_start = t_now;
+                            *on = false;
+                        }
+                    },
+                    false => {
+                        let dt_state = t_now - *t_state_start;
+                        if dt_state >= qcw_params.offtime_ms * 1000 {
+                            with_devices_mut(|devices, _| {
+                                qcw::configure_signal_path(devices, SignalPathConfig::OpenLoop {
+                                    period_clocks: (400_000.0 / qcw_params.startup_frequency_khz) as u16,
+                                    conduction_angle: qcw_params.flat_power * 0.5
+                                });
+                            });
+                            *t_state_start = t_now;
+                            *on = true;
+                        }
+                    }
+                }
+            },
+        }
+    } else {
+        if *on {
+            with_devices_mut(|devices, _| {
+                qcw::configure_signal_path(devices, SignalPathConfig::Disabled);
+            });
+            *on = false;
+        }
     }
-    min > min_period && (max - min) < allowed_deviation
-}
-
-fn feedback_ramp(t: f32) -> f32 {
-    t
 }

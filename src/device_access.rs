@@ -111,6 +111,16 @@ pub fn set_devices(devices: stm32h753::Peripherals) {
             .tim5rst().clear_bit()
     });
 
+    // enable and reset USART2
+    devices.RCC.apb1lenr.modify(|_, w| w.usart2en().set_bit());
+    devices.RCC.apb1lrstr.modify(|_, w| w.usart2rst().set_bit());
+    devices.RCC.apb1lrstr.modify(|_, w| w.usart2rst().clear_bit());
+
+    // enable and reset ADC1/ADC2
+    devices.RCC.ahb1enr.modify(|_, w| w.adc12en().set_bit());
+    devices.RCC.ahb1rstr.modify(|_, w| w.adc12rst().set_bit());
+    devices.RCC.ahb1rstr.modify(|_, w| w.adc12rst().clear_bit());
+
     cortex_m::interrupt::free(|cs| {
         DEVICES.borrow(cs).borrow_mut().write(devices);
     });

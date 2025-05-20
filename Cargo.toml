@@ -1,5 +1,6 @@
 [package]
 name = "stm32_qcw_rust"
+edition = "2024"
 
 [dependencies.stm32h7]
 version = "0.15.1"
@@ -7,6 +8,8 @@ features = ["stm32h753"]
 
 [dependencies]
 cortex-m-rt = "*"
-cortex-m = "*"
+cortex-m = {version = "*", features = ["critical-section-single-core"]}
 panic-halt = "*"
 libm = "0.2.11"
+embedded-alloc = "0.6"
+qcw_com = { path = "../qcw_com" }

@@ -40,7 +40,7 @@ pub fn setup_system_pll(peripherals: &mut Peripherals, speed: SystemPllSpeed) {
         });
         peripherals.RCC.pllckselr.modify(|_, w| {
             w
-                // set ref1_ck divider to 2
+                // set ref1_ck divider to 2, giving us a pll source clock of 12.5 MHz
                 .divm1().bits(2)
         });
         peripherals.RCC.pllcfgr.modify(|_, w| {
@@ -56,7 +56,7 @@ pub fn setup_system_pll(peripherals: &mut Peripherals, speed: SystemPllSpeed) {
                 .divq1en().clear_bit()
                 .divr1en().clear_bit()
         });
-        peripherals.RCC.pll1divr.write_with_zero(|w| {
+        peripherals.RCC.pll1divr.write(|w| {
             let w = w
                 // set PLL1's feedback divider to 64, giving us a VCO frequency of 800 MHz
                 .divn1().bits(63);
