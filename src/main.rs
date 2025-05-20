@@ -82,7 +82,7 @@ fn main() -> ! {
 
     let mut qcw_params = QcwParameters {
         delay_compensation_ns: 0,
-        startup_frequency_khz: 600.0,
+        startup_frequency_khz: 515.0,
 
         run_mode: RunMode::OpenLoop,
 
@@ -116,18 +116,12 @@ fn main() -> ! {
     let mut inbox = VecDeque::new();
     let mut outbox = VecDeque::new();
 
-    let mut last_feedback_measurement = None;
-
     loop {
         let t_now = time::micros();
         let primary_current = current_monitor::get_current();
         let feedback_measurement = with_devices_mut(|devices, _| {
             qcw::read_capture_timer(devices)
         });
-
-        if feedback_measurement.is_some() {
-            last_feedback_measurement = feedback_measurement.clone();
-        }
 
         let dt_last_keepalive = t_now - t_last_keepalive;
 
@@ -139,7 +133,7 @@ fn main() -> ! {
                 running = false;
             }
         }
-        update_runmode(&qcw_params, running, &mut on, t_now, &mut t_state_start, last_feedback_measurement.clone());
+        update_runmode(&qcw_params, running, &mut on, t_now, &mut t_state_start, feedback_measurement.clone());
 
         qcw_stats.max_primary_current = qcw_stats.max_primary_current.max(primary_current);
         if let Some(measurement) = feedback_measurement {
@@ -267,6 +261,12 @@ fn update_runmode(qcw_params: &QcwParameters, running: bool, on: &mut bool, t_no
                     false => {
                         let dt_state = t_now - *t_state_start;
                         if dt_state >= qcw_params.offtime_ms * 1000 {
+                            with_devices_mut(|devices, _| {
+                                qcw::configure_signal_path(devices, SignalPathConfig::OpenLoop {
+                                    period_clocks: (400_000.0 / qcw_params.startup_frequency_khz) as u16,
+                                    conduction_angle: qcw_params.flat_power * 0.5
+                                });
+                            });
                             *t_state_start = t_now;
                             *on = true;
                         }
