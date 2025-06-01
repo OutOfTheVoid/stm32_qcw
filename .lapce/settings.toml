@@ -1,0 +1,5 @@
+[lapce-rust]
+"check.command" = "check"
+"diagnostics.enable" = true
+"cargo.allTargets" = false
+"cargo.target" = "thumbv7em-none-eabihf"

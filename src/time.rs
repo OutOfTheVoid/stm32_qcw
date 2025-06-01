@@ -51,10 +51,14 @@ pub fn nanos() -> u64 {
 
 pub fn micros() -> u64 {
     with_devices(|devices, _| {
-        (devices.TIM3.cnt.read().cnt().bits() as u64 / 10).wrapping_add(
-            devices.TIM5.cnt.read().cnt().bits() as u64 * 1000
-        )
+        micros_with_devices(devices)
     })
+}
+
+pub fn micros_with_devices(devices: &Peripherals) -> u64 {
+    (devices.TIM3.cnt.read().cnt().bits() as u64 / 10).wrapping_add(
+        devices.TIM5.cnt.read().cnt().bits() as u64 * 1000
+    )
 }
 
 pub fn millis() -> u64 {

@@ -1,9 +1,11 @@
 #![allow(unused)]
 
-use cortex_m::delay;
-use stm32h7::stm32h753::Peripherals;
+use core::{cell::RefCell, sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering}};
 
-use crate::device_access::with_devices_mut;
+use cortex_m::{delay, interrupt::{CriticalSection, Mutex}};
+use stm32h7::stm32h753::{self, interrupt, sdmmc1::power, Peripherals};
+
+use crate::{debug_led, device_access::with_devices_mut, time};
 
 /*
 QCW Signal Path
@@ -87,7 +89,7 @@ It also protects us in the event that feedback stops working for some other reas
 */
 
 pub fn init() {
-    with_devices_mut(|devices, _| {
+    with_devices_mut(|devices, cs| {
         // Setup the output timers first, so we enable gpio in to a known-good state. Initially, pull-downs
         // on the gate driver inputs should prevent us from activating the bridge at all.
         setup_output_timers(devices);
@@ -96,7 +98,7 @@ pub fn init() {
         // Setup the phase timer (timer b) generally.
         setup_phase_timer(devices);
         // setup the signal path as disabled initially
-        configure_signal_path(devices, SignalPathConfig::Disabled);
+        configure_signal_path(devices, cs, SignalPathConfig::Disabled);
         // Once the output timers are initialized into a known-good state, we can activate the gpio. Both
         // outputs initialize in the same state, so the bridge won't send any current through the primary
         // circuit yet.
@@ -329,26 +331,44 @@ fn setup_capture_timer(devices: &mut Peripherals) {
         w.cpt1ie().set_bit()
     });
     devices.HRTIM_MASTER.mcr.modify(|_, w| w.tdcen().set_bit());
+
+    QCW_CLOSED_LOOP_ACTIVE.store(false, Ordering::SeqCst);
+
+    unsafe {
+        stm32h753::NVIC::unmask(stm32h753::Interrupt::HRTIM1_TIMD);
+    }
 }
 
 pub fn read_capture_timer(devices: &mut Peripherals) -> Option<u16> {
-    if devices.HRTIM_TIMD.timdisr.read().cpt1().bit_is_set() {
+    /*if devices.HRTIM_TIMD.timdisr.read().cpt1().bit_is_set() {
         let value = devices.HRTIM_TIMD.cpt1dr.read().cpt1x().bits();
         devices.HRTIM_TIMD.timdicr.write(|w| w.cpt1c().set_bit());
         Some(value)
     } else {
         None
+    }*/
+    let capture_value = QCW_CAPTURE_VALUE.load(Ordering::SeqCst);
+    static mut LAST_READ_ID: u16 = 0xFFFF;
+    let capture_id = (capture_value >> 16) as u16;
+    unsafe {
+        if LAST_READ_ID != capture_id {
+            LAST_READ_ID = capture_id;
+            Some((capture_value & 0xFFFF) as u16)
+        } else {
+            None
+        }
     }
+
 }
 
 #[derive(Copy, Clone, Debug)]
 pub enum SignalPathConfig {
     Disabled,
     OpenLoop { period_clocks: u16, conduction_angle: f32 },
-    ClosedLoop { period_clocks: u16, conduction_angle: f32, delay_compensation_clocks: i16 }
+    ClosedLoop { period_clocks: u16, delay_compensation_clocks: i16, power_profile: ClosedLoopPowerProfile },
 }
 
-pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig) {
+pub fn configure_signal_path(devices: &mut Peripherals, cs: &'_ CriticalSection, config: SignalPathConfig) {
     match config {
         SignalPathConfig::Disabled => {
             /* 
@@ -359,6 +379,7 @@ pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig
             devices.HRTIM_MASTER.mcr.modify(|_, w| {
                 w.tbcen().clear_bit()
             });
+            QCW_CLOSED_LOOP_ACTIVE.store(false, Ordering::SeqCst);
         },
         SignalPathConfig::OpenLoop { period_clocks, conduction_angle } => {
             /*
@@ -375,6 +396,7 @@ pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig
                 w
                     .cont().set_bit()
                     .retrig().set_bit()
+                    .tx_rstu().clear_bit()
             });
 
             let half_period = period_clocks / 2;
@@ -398,8 +420,15 @@ pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig
 
             // and enable it
             devices.HRTIM_MASTER.mcr.modify(|_, w| w.tbcen().set_bit());
+            QCW_CLOSED_LOOP_ACTIVE.store(false, Ordering::SeqCst);
         },
-        SignalPathConfig::ClosedLoop { period_clocks, conduction_angle, delay_compensation_clocks } => {
+        SignalPathConfig::ClosedLoop { period_clocks, delay_compensation_clocks, power_profile } => {
+            let t_start = time::micros_with_devices(&devices);
+
+            let start_power = power_profile.get_power(t_start);
+
+            *QCW_POWER_PROFILE.borrow(cs).borrow_mut() = power_profile;
+
             let half_period = period_clocks / 2;
 
             // disable timer b updates
@@ -411,13 +440,14 @@ pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig
                 w
                     .retrig().set_bit()
                     .cont().clear_bit()
+                    .tx_rstu().set_bit()
             });
             // set the period to something larger than a cycle
             devices.HRTIM_TIMB.perbr.modify(|_, w| w.perx().variant(0xF000));
 
             // compute phase delays
             let phase_a_delay = half_period as i32 + delay_compensation_clocks as i32;
-            let phase_b_delay = half_period as i32 + delay_compensation_clocks as i32;// + (half_period as f32 * (1.0 - conduction_angle)) as i32;
+            let phase_b_delay = half_period as i32 + delay_compensation_clocks as i32 + (half_period as f32 * (1.0 - start_power)) as i32;
 
             // setup output timers to be period at operating frequency
             devices.HRTIM_TIMA.cmp1ar.modify(|_, w| w.cmp1x().variant(half_period));
@@ -439,7 +469,86 @@ pub fn configure_signal_path(devices: &mut Peripherals, config: SignalPathConfig
 
             // and enable it
             devices.HRTIM_MASTER.mcr.modify(|_, w| w.tbcen().set_bit());
+            QCW_CLOSED_LOOP_COMPENSATION.store(delay_compensation_clocks as u16, Ordering::SeqCst);
+            QCW_CLOSED_LOOP_ACTIVE.store(true, Ordering::SeqCst);
         }
     }
 }
 
+static QCW_CLOSED_LOOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static QCW_CAPTURE_VALUE: AtomicU32 = AtomicU32::new(0);
+static QCW_CAPTURE_COUNTER: AtomicU16 = AtomicU16::new(0);
+static QCW_CLOSED_LOOP_COMPENSATION: AtomicU16 = AtomicU16::new(0);
+
+static QCW_POWER_PROFILE: Mutex<RefCell<ClosedLoopPowerProfile>> = Mutex::new(RefCell::new(ClosedLoopPowerProfile::Constant(0.1)));
+
+
+#[derive(Copy, Clone, Debug)]
+pub enum ClosedLoopPowerProfile {
+    Constant(f32),
+    Ramp {
+        t_start: u64,
+        start: f32,
+        end: f32,
+        t_ramp: u64,
+    }
+}
+
+impl ClosedLoopPowerProfile {
+    pub fn get_power(&self, t_now: u64) -> f32 {
+        match self {
+            Self::Constant(power) => *power,
+            Self::Ramp { t_start, start, end, t_ramp } => {
+                let t = (t_now - *t_start).clamp(0, *t_ramp);
+                let k = t as f32  / *t_ramp as f32;
+                k * (*end - *start) + *start
+            }
+        }
+    }
+}
+
+#[interrupt]
+fn HRTIM1_TIMD() {
+    with_devices_mut(|devices, cs| {
+        if devices.HRTIM_TIMD.timdisr.read().cpt1().bit_is_set() {
+            let capture = devices.HRTIM_TIMD.cpt1dr.read().cpt1x().bits();
+            devices.HRTIM_TIMD.timdicr.write(|w| w.cpt1c().set_bit());
+
+            let period_clocks = QCW_CAPTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let capture_value =
+                ((period_clocks as u32) << 16) |
+                (capture as u32);
+            
+            QCW_CAPTURE_VALUE.store(capture_value, Ordering::SeqCst);
+            
+            if QCW_CLOSED_LOOP_ACTIVE.load(Ordering::SeqCst) {
+                let t_now = time::micros_with_devices(devices);
+                let power = QCW_POWER_PROFILE.borrow(cs).borrow_mut().get_power(t_now);
+
+                let delay_compensation_clocks = QCW_CLOSED_LOOP_COMPENSATION.load(Ordering::SeqCst) as i16;
+                let half_period = period_clocks / 2;
+    
+                // disable timer b updates
+                devices.HRTIM_COMMON.cr1.modify(|_, w| w.tbudis().set_bit());
+                
+                // compute phase delays
+                let phase_a_delay = half_period as i32 + delay_compensation_clocks as i32;
+                let phase_b_delay = half_period as i32 + delay_compensation_clocks as i32 + (half_period as f32 * (1.0 - power)) as i32;
+    
+                // setup output timers to be period at operating frequency
+                devices.HRTIM_TIMA.cmp1ar.modify(|_, w| w.cmp1x().variant(half_period));
+                devices.HRTIM_TIMC.cmp1cr.modify(|_, w| w.cmp1x().variant(half_period));
+    
+                // setup timer b to trigger our output timers periodically (with a phase delay for phase b)
+                // for symmetric phase delay, could subtract half the delay from a, and add half the delay to b, but for now lets keep it simple
+                devices.HRTIM_TIMB.cmp1br.modify(|_, w| w.cmp1x().variant(phase_a_delay as u16));
+                devices.HRTIM_TIMB.cmp2br.modify(|_, w| w.cmp2x().variant(phase_b_delay as u16));
+    
+                // update timer b
+                devices.HRTIM_COMMON.cr1.modify(|_, w| w.tbudis().clear_bit());
+                devices.HRTIM_COMMON.cr2.modify(|_, w| w.tbswu().set_bit());
+            }
+
+        }
+    });
+}
